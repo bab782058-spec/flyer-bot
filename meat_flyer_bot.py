@@ -81,21 +81,36 @@ def download_image_as_base64(image_url):
     return base64.b64encode(res.content).decode("utf-8")
 
 
-def extract_meat_deals_with_gemini(image_base64):
-    """チラシ画像から、生肉の特売情報だけをJSONで抽出する"""
-    prompt = """これはスーパーのチラシ画像です。
-この中から「生肉」(牛肉・豚肉・鶏肉・ひき肉などの精肉)の特売情報だけを抽出してください。
-ハム・ソーセージ・唐揚げなどの加工品、魚介類、野菜、その他の商品は対象外です。
+def extract_meat_deals_with_gemini(image_base64, target_date_str):
+    """チラシ画像から、本日有効な生肉の特売情報だけをJSONで抽出する"""
+    prompt = f"""これはスーパーのチラシ画像です。本日の日付は {target_date_str} です。
 
-出力は、説明文やMarkdownを含めず、次の形式の**JSON配列のみ**にしてください。
+## 抽出対象
+「生肉」(牛肉・豚肉・鶏肉の精肉全般)の特売情報を抽出してください。
+部位の種類は問いません。バラ肉・ロース肉・モモ肉・肩ロース肉はもちろん、
+**ひき肉(挽肉)、むね肉、もも肉、ささみなど、見た目が地味で小さく掲載されている商品も見落とさないでください**。
+チラシの端や、小さい文字で書かれた箇所も含めて、画像全体を隅々まで確認してください。
+
+## 対象外
+ハム・ソーセージ・唐揚げ・加工肉、魚介類、野菜、惣菜、その他の商品は対象外です。
+
+## 日付の扱い(重要)
+チラシ内の商品には「10/5限り」「10/4(日)・5(月)2日間」「10/1〜31まで」のように、
+適用期間が商品ごと・コーナーごとに書かれていることがあります。
+**本日({target_date_str})が、その適用期間に含まれる商品だけを抽出してください。**
+期間の記載が無い商品は、チラシ全体の掲載期間が本日を含む場合のみ対象としてください。
+本日が対象期間に含まれない商品は、たとえ目立つ場所にあっても抽出しないでください。
+
+## 出力形式
+説明文やMarkdownを含めず、次の形式の**JSON配列のみ**にしてください。
 該当する生肉の特売情報が無ければ、空配列 [] を返してください。
 
 [
-  {
+  {{
     "product": "商品名(例: 国産豚バラ肉)",
     "price": "価格の記載(例: 198円(税込)/100g)",
     "discount": "割引率の記載があれば(例: 20%引き)。無ければ null"
-  }
+  }}
 ]
 """
 
@@ -116,7 +131,9 @@ def extract_meat_deals_with_gemini(image_base64):
                     },
                 ]
             }
-        ]
+        ],
+        # 商品数が多いチラシでも出力が途中で切れないよう、余裕を持たせる
+        "generationConfig": {"maxOutputTokens": 4096},
     }
 
     res = requests.post(url, json=payload, timeout=60)
@@ -267,6 +284,9 @@ def send_line_text_fallback(text):
 
 
 def main():
+    today_str = build_date_header()
+    print(f"本日: {today_str}")
+
     print("チラシ一覧を取得中...")
     leaflet_ids = get_leaflet_ids()
     print(f"見つかったチラシ数: {len(leaflet_ids)} -> {leaflet_ids}")
@@ -286,7 +306,7 @@ def main():
         print(f"チラシ {leaflet_id} の画像を解析中... ({image_url})")
         try:
             image_b64 = download_image_as_base64(image_url)
-            deals = extract_meat_deals_with_gemini(image_b64)
+            deals = extract_meat_deals_with_gemini(image_b64, today_str)
             all_deals.extend(deals)
         except Exception as e:
             print(f"[WARN] チラシ {leaflet_id} の解析に失敗: {e}", file=sys.stderr)
