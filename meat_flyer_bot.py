@@ -64,8 +64,9 @@ def get_leaflet_image_url(leaflet_id):
     res.raise_for_status()
     html = res.text
 
+    # &(HTMLエスケープされた &quot; などの手前)でも止まるようにする
     match = re.search(
-        r'https://image\.tokubai\.co\.jp/images/[^\s"\'<>()]+\.jpg(?:\?[^\s"\'<>()]*)?',
+        r'https://image\.tokubai\.co\.jp/images/[^\s"\'<>()&]+\.jpg(?:\?[^\s"\'<>()&]*)?',
         html,
     )
     if not match:
@@ -100,7 +101,7 @@ def extract_meat_deals_with_gemini(image_base64):
 
     url = (
         "https://generativelanguage.googleapis.com/v1beta/models/"
-        f"gemini-2.0-flash:generateContent?key={GEMINI_API_KEY}"
+        f"gemini-flash-latest:generateContent?key={GEMINI_API_KEY}"
     )
     payload = {
         "contents": [
