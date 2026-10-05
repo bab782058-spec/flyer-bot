@@ -1,0 +1,30 @@
+name: Daily Meat Flyer to LINE
+
+on:
+  # 外部のcron(自分のサーバー/PC/無料cronサービスなど)から、
+  # 下記のcurlコマンドで呼び出すためのトリガー
+  repository_dispatch:
+    types: [meat-flyer-trigger]
+  # ブラウザから手動実行したいときのためのボタンも残しておく
+  workflow_dispatch:
+
+jobs:
+  send-meat-flyer:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: pip install requests
+
+      - name: Run meat flyer bot
+        env:
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          LINE_CHANNEL_ACCESS_TOKEN_MEAT: ${{ secrets.LINE_CHANNEL_ACCESS_TOKEN_MEAT }}
+        run: python meat_flyer_bot.py
