@@ -23,6 +23,7 @@ Geminiの画像認識で抽出して、LINEに送るスクリプト。
 import os
 import re
 import sys
+import time
 import base64
 import datetime
 import requests
@@ -136,8 +137,34 @@ def extract_meat_deals_with_gemini(image_base64, target_date_str):
         "generationConfig": {"maxOutputTokens": 4096},
     }
 
-    res = requests.post(url, json=payload, timeout=60)
-    res.raise_for_status()
+    # Geminiのサーバーが一時的に混雑している(503)/レート制限(429)の場合に備えて
+    # 少し待ってから数回リトライする
+    max_retries = 4
+    last_error = None
+    res = None
+    for attempt in range(1, max_retries + 1):
+        try:
+            res = requests.post(url, json=payload, timeout=60)
+            if res.status_code in (429, 503):
+                raise requests.HTTPError(
+                    f"{res.status_code} temporary error", response=res
+                )
+            res.raise_for_status()
+            last_error = None
+            break
+        except requests.HTTPError as e:
+            last_error = e
+            wait_seconds = 5 * attempt  # 5秒, 10秒, 15秒, 20秒と少しずつ待つ
+            print(
+                f"[WARN] Gemini呼び出しが失敗(試行{attempt}/{max_retries}): {e}. "
+                f"{wait_seconds}秒待って再試行します",
+                file=sys.stderr,
+            )
+            time.sleep(wait_seconds)
+
+    if last_error is not None:
+        raise RuntimeError(f"Geminiの呼び出しが{max_retries}回とも失敗しました: {last_error}")
+
     data = res.json()
 
     try:
