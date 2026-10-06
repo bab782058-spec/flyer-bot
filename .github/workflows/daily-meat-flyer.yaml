@@ -26,5 +26,8 @@ jobs:
       - name: Run meat flyer bot
         env:
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          GEMINI_MODEL: ${{ vars.GEMINI_MODEL }}
           LINE_CHANNEL_ACCESS_TOKEN_MEAT: ${{ secrets.LINE_CHANNEL_ACCESS_TOKEN_MEAT }}
+          # ログの出力順が実際の実行順と一致するよう、バッファリングを無効化
+          PYTHONUNBUFFERED: "1"
         run: python meat_flyer_bot.py
