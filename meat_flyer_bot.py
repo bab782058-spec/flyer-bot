@@ -7,12 +7,15 @@ Geminiの画像認識で抽出して、LINEに送るスクリプト。
 - GEMINI_API_KEY: Gemini APIキー(news_bot.pyと共通でOK)
 - LINE_CHANNEL_ACCESS_TOKEN_MEAT: このbot専用のLINE公式アカウントのチャネルアクセストークン
   (news_bot.pyとは別のLINE公式アカウント・別のトークンを使う)
+- GEMINI_MODEL(任意): 未指定なら DEFAULT_GEMINI_MODEL
+- GEMINI_FALLBACK_MODELS(任意): カンマ区切り。主モデルが使えないとき順に試す予備モデル
 
 仕組み:
 1. トクバイの店舗ページ(通常のHTTPリクエストで取得できる)から、
    現在掲載中のチラシのリンク(leaflet ID)を抽出
 2. 各チラシの show_for_widget ページから、直接の画像URLを抽出
 3. 画像をダウンロードし、Geminiに「生肉の特売情報だけ抽出して」と指示
+   (news_bot.pyと同じ、主モデル→予備モデルの自動フォールバック構成)
 4. 複数チラシ分の結果をまとめて、LINEにFlexメッセージで送信
 
 注意:
@@ -24,9 +27,20 @@ import os
 import re
 import sys
 import time
+import json
 import base64
 import datetime
 import requests
+
+# 常に最新のFlashモデルを使うため、エイリアス gemini-flash-latest を既定にしている。
+# Googleが新しいFlashを出すと、このエイリアスの指す先が自動で入れ替わる。
+# 挙動を固定したいときは、GitHubの Variables に GEMINI_MODEL を登録して、
+# gemini-3.6-flash のようにバージョンを明示する。
+DEFAULT_GEMINI_MODEL = "gemini-flash-latest"
+# 主モデルが混雑(503)・無料枠の上限(429)・提供終了(404)のときに順に試す予備モデル。
+# 存在しないモデル名だった場合は404としてスキップされるだけで、実行は止まらない。
+# GitHubの Variables に GEMINI_FALLBACK_MODELS(カンマ区切り)を登録すると差し替えられる。
+DEFAULT_FALLBACK_MODELS = ["gemini-flash-lite-latest", "gemini-3.5-flash-lite", "gemini-3.1-flash-lite"]
 
 GEMINI_API_KEY = os.environ["GEMINI_API_KEY"]
 LINE_CHANNEL_ACCESS_TOKEN = os.environ["LINE_CHANNEL_ACCESS_TOKEN_MEAT"]
@@ -82,6 +96,96 @@ def download_image_as_base64(image_url):
     return base64.b64encode(res.content).decode("utf-8")
 
 
+def _post_with_retry(model, headers, payload, waits):
+    """1つのモデルに対し、一時的なエラー(混雑・上限・通信エラー)なら待って再試行する。
+    最後の応答(通信自体に失敗した場合は None)を返す"""
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
+    retry_statuses = {429, 500, 502, 503, 504}
+    res = None
+    for attempt in range(len(waits) + 1):
+        try:
+            res = requests.post(url, headers=headers, json=payload, timeout=120)
+            if res.status_code not in retry_statuses:
+                return res
+            reason = f"HTTP {res.status_code}"
+        except (requests.ConnectionError, requests.Timeout) as e:
+            res = None
+            reason = f"通信エラー: {e}"
+        if attempt < len(waits):
+            print(
+                f"[WARN] {model} が一時的に使えません({reason})。"
+                f"{waits[attempt]}秒待って再試行します({attempt + 1}/{len(waits)})",
+                file=sys.stderr,
+            )
+            time.sleep(waits[attempt])
+    return res
+
+
+def gemini_generate_with_image(prompt, image_base64):
+    """Geminiに画像+プロンプトを渡し、出力テキストを返す。
+    主モデルが混雑(503など)や提供終了(404)で使えないときは、予備モデルに自動で切り替える"""
+    primary = os.environ.get("GEMINI_MODEL", "").strip() or DEFAULT_GEMINI_MODEL
+    fallbacks_env = os.environ.get("GEMINI_FALLBACK_MODELS")
+    fallbacks = (
+        [m.strip() for m in fallbacks_env.split(",") if m.strip()]
+        if fallbacks_env is not None
+        else DEFAULT_FALLBACK_MODELS
+    )
+    models = []
+    for m in [primary] + fallbacks:
+        if m not in models:
+            models.append(m)
+
+    headers = {
+        "Content-Type": "application/json",
+        "x-goog-api-key": GEMINI_API_KEY,
+    }
+    payload = {
+        "contents": [
+            {
+                "parts": [
+                    {"text": prompt},
+                    {"inline_data": {"mime_type": "image/jpeg", "data": image_base64}},
+                ]
+            }
+        ],
+        # 商品数が多いチラシでも出力が途中で切れないよう、余裕を持たせる
+        "generationConfig": {
+            "responseMimeType": "application/json",
+            "maxOutputTokens": 4096,
+        },
+    }
+
+    failures = []
+    res = None
+    for i, model in enumerate(models):
+        # 主モデルは少し粘り、予備モデルは短めに待つ(全体が長引かないように)
+        waits = [10, 20, 40] if i == 0 else [5, 10]
+        res = _post_with_retry(model, headers, payload, waits)
+        if res is not None and res.status_code == 200:
+            if i > 0:
+                print(f"[INFO] 予備モデル {model} で成功しました")
+            break
+        if res is None:
+            failures.append(f"{model}: 接続できませんでした")
+        elif res.status_code in (429, 500, 502, 503, 504, 404):
+            # 混雑・上限・モデル提供終了は、次のモデルで試す価値がある
+            failures.append(f"{model}: HTTP {res.status_code} {res.text[:200]}")
+        else:
+            # 400/401/403(キーが無効など)は、モデルを変えても直らないので即エラー
+            raise RuntimeError(f"Gemini APIエラー(model={model}): {res.status_code} {res.text[:500]}")
+        print(f"[WARN] {failures[-1][:150]} → 次のモデルを試します", file=sys.stderr)
+    else:
+        raise RuntimeError("すべてのGeminiモデルで失敗しました: " + " | ".join(failures))
+
+    data = res.json()
+    try:
+        parts = data["candidates"][0]["content"]["parts"]
+        return "".join(p.get("text", "") for p in parts)
+    except (KeyError, IndexError, TypeError) as e:
+        raise RuntimeError(f"Geminiの応答解析に失敗しました: {data}") from e
+
+
 def extract_meat_deals_with_gemini(image_base64, target_date_str):
     """チラシ画像から、本日有効な生肉の特売情報だけをJSONで抽出する"""
     prompt = f"""これはスーパーのチラシ画像です。本日の日付は {target_date_str} です。
@@ -115,69 +219,14 @@ def extract_meat_deals_with_gemini(image_base64, target_date_str):
 ]
 """
 
-    url = (
-        "https://generativelanguage.googleapis.com/v1beta/models/"
-        f"gemini-flash-latest:generateContent?key={GEMINI_API_KEY}"
-    )
-    payload = {
-        "contents": [
-            {
-                "parts": [
-                    {"text": prompt},
-                    {
-                        "inline_data": {
-                            "mime_type": "image/jpeg",
-                            "data": image_base64,
-                        }
-                    },
-                ]
-            }
-        ],
-        # 商品数が多いチラシでも出力が途中で切れないよう、余裕を持たせる
-        "generationConfig": {"maxOutputTokens": 4096},
-    }
-
-    # Geminiのサーバーが一時的に混雑している(503)/レート制限(429)の場合に備えて
-    # 少し待ってから数回リトライする
-    max_retries = 4
-    last_error = None
-    res = None
-    for attempt in range(1, max_retries + 1):
-        try:
-            res = requests.post(url, json=payload, timeout=60)
-            if res.status_code in (429, 503):
-                raise requests.HTTPError(
-                    f"{res.status_code} temporary error", response=res
-                )
-            res.raise_for_status()
-            last_error = None
-            break
-        except requests.HTTPError as e:
-            last_error = e
-            wait_seconds = 5 * attempt  # 5秒, 10秒, 15秒, 20秒と少しずつ待つ
-            print(
-                f"[WARN] Gemini呼び出しが失敗(試行{attempt}/{max_retries}): {e}. "
-                f"{wait_seconds}秒待って再試行します",
-                file=sys.stderr,
-            )
-            time.sleep(wait_seconds)
-
-    if last_error is not None:
-        raise RuntimeError(f"Geminiの呼び出しが{max_retries}回とも失敗しました: {last_error}")
-
-    data = res.json()
-
-    try:
-        raw_text = data["candidates"][0]["content"]["parts"][0]["text"].strip()
-    except (KeyError, IndexError) as e:
-        raise RuntimeError(f"Geminiの応答解析に失敗しました: {data}") from e
+    raw_text = gemini_generate_with_image(prompt, image_base64)
 
     cleaned = raw_text.strip()
     if cleaned.startswith("```"):
         cleaned = cleaned.split("```")[1]
         cleaned = cleaned[4:] if cleaned.startswith("json") else cleaned
+        cleaned = cleaned.strip()
 
-    import json
     return json.loads(cleaned)
 
 
@@ -233,13 +282,23 @@ def build_flex_message(meat_deals):
                         + (
                             [
                                 {
-                                    "type": "text",
-                                    "text": item.get("discount"),
-                                    "size": "xxs",
-                                    "color": "#FFFFFF",
+                                    # backgroundColorは「box」にしか指定できないため、
+                                    # textをboxで包んでバッジ風に見せる
+                                    "type": "box",
+                                    "layout": "vertical",
                                     "backgroundColor": "#B23B3B",
-                                    "align": "center",
+                                    "cornerRadius": "4px",
+                                    "paddingAll": "2px",
                                     "margin": "sm",
+                                    "contents": [
+                                        {
+                                            "type": "text",
+                                            "text": item.get("discount"),
+                                            "size": "xxs",
+                                            "color": "#FFFFFF",
+                                            "align": "center",
+                                        }
+                                    ],
                                 }
                             ]
                             if item.get("discount")
