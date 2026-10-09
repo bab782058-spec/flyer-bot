@@ -223,7 +223,7 @@ class GeminiClient:
         }
 
         failures = []
-        for index, model in enumerate(self._models):
+        for index, model in enumerate(list(self._models)):
             waits = PRIMARY_MODEL_RETRY_WAITS if index == 0 else FALLBACK_MODEL_RETRY_WAITS
             response = self._post_with_retry(model, payload, waits)
 
@@ -240,8 +240,14 @@ class GeminiClient:
                 # 400/401/403(キー不正など)はモデルを変えても直らないので、即エラーにする
                 raise GeminiError(f"Gemini APIエラー(model={model}): {response.status_code} {response.text[:500]}")
             print(f"[WARN] {failures[-1][:150]} → 次のモデルを試します", file=sys.stderr)
+            self._demote(model)
 
         raise GeminiError("すべてのGeminiモデルで失敗しました: " + " | ".join(failures))
+
+    def _demote(self, model):
+        """リトライを尽くして駄目だったモデルを最後尾へ回す(次のチラシで同じ待ち時間を繰り返さないため)"""
+        self._models.remove(model)
+        self._models.append(model)
 
     def _post_with_retry(self, model, payload, waits):
         """一時的な不調なら待って再試行する。最後の応答を返す(通信自体に失敗し続けたら None)"""
