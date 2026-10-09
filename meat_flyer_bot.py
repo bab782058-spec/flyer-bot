@@ -39,7 +39,7 @@ STORE_PAGE_URL = "https://tokubai.co.jp/%E3%83%9E%E3%83%AB%E3%82%A8%E3%83%84/130
 # GitHubの Variables に GEMINI_MODEL を登録して、バージョンを明示する。
 DEFAULT_GEMINI_MODEL = "gemini-flash-latest"
 # 主モデルが混雑(503)・上限(429)・提供終了(404)のときに順に試す予備モデル。
-DEFAULT_FALLBACK_MODELS = ["gemini-flash-lite-latest", "gemini-3.5-flash-lite", "gemini-3.1-flash-lite"]
+DEFAULT_FALLBACK_MODELS = []  # liteは精度が落ちるため使わない。必要なら環境変数 GEMINI_FALLBACK_MODELS で指定
 
 GEMINI_ENDPOINT = "https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
 LINE_BROADCAST_URL = "https://api.line.me/v2/bot/message/broadcast"
@@ -48,7 +48,7 @@ LINE_BROADCAST_URL = "https://api.line.me/v2/bot/message/broadcast"
 RETRYABLE_STATUSES = {429, 500, 502, 503, 504}
 # 再試行しても直らないが、別のモデルなら成功しうるステータス(404 = モデル提供終了)
 FALLBACK_STATUSES = RETRYABLE_STATUSES | {404}
-PRIMARY_MODEL_RETRY_WAITS = [10, 20, 40]  # 主モデルは粘る
+PRIMARY_MODEL_RETRY_WAITS = [15, 30, 60, 60]  # 主モデルは粘る(精度優先。チラシ1枚あたり最大約2.8分)
 FALLBACK_MODEL_RETRY_WAITS = [5, 10]  # 予備モデルは短めに(全体が長引かないように)
 
 GEMINI_TIMEOUT_SECONDS = 120
@@ -223,7 +223,7 @@ class GeminiClient:
         }
 
         failures = []
-        for index, model in enumerate(list(self._models)):
+        for index, model in enumerate(self._models):
             waits = PRIMARY_MODEL_RETRY_WAITS if index == 0 else FALLBACK_MODEL_RETRY_WAITS
             response = self._post_with_retry(model, payload, waits)
 
@@ -240,14 +240,8 @@ class GeminiClient:
                 # 400/401/403(キー不正など)はモデルを変えても直らないので、即エラーにする
                 raise GeminiError(f"Gemini APIエラー(model={model}): {response.status_code} {response.text[:500]}")
             print(f"[WARN] {failures[-1][:150]} → 次のモデルを試します", file=sys.stderr)
-            self._demote(model)
 
         raise GeminiError("すべてのGeminiモデルで失敗しました: " + " | ".join(failures))
-
-    def _demote(self, model):
-        """リトライを尽くして駄目だったモデルを最後尾へ回す(次のチラシで同じ待ち時間を繰り返さないため)"""
-        self._models.remove(model)
-        self._models.append(model)
 
     def _post_with_retry(self, model, payload, waits):
         """一時的な不調なら待って再試行する。最後の応答を返す(通信自体に失敗し続けたら None)"""
