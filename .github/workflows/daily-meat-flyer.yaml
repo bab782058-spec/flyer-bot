@@ -1,16 +1,20 @@
 name: Daily Meat Flyer to LINE
 
+# 定時起動は、cron-job.org から repository_dispatch(meat-flyer-trigger)を送って行う。
+# 手動実行(Actions → Run workflow)と、LINEの「再実行」(line-retry-worker)も同じ仕組みで動く。
 on:
-  # 外部のcron(自分のサーバー/PC/無料cronサービスなど)から、
-  # 下記のcurlコマンドで呼び出すためのトリガー
   repository_dispatch:
     types: [meat-flyer-trigger]
-  # ブラウザから手動実行したいときのためのボタンも残しておく
   workflow_dispatch:
+
+concurrency:
+  group: meat-flyer
+  cancel-in-progress: false   # 実行中に再実行が来ても、前の実行は止めず順番待ちにする
 
 jobs:
   send-meat-flyer:
     runs-on: ubuntu-latest
+    timeout-minutes: 45   # Geminiが長時間止まっているときに、実行時間を食いつぶさないため
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -26,8 +30,7 @@ jobs:
       - name: Run meat flyer bot
         env:
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
-          GEMINI_MODEL: ${{ vars.GEMINI_MODEL }}
+          GEMINI_MODELS: ${{ vars.GEMINI_MODELS }}   # 任意。未登録なら、使えるモデルを自動で選ぶ
           LINE_CHANNEL_ACCESS_TOKEN_MEAT: ${{ secrets.LINE_CHANNEL_ACCESS_TOKEN_MEAT }}
-          # ログの出力順が実際の実行順と一致するよう、バッファリングを無効化
-          PYTHONUNBUFFERED: "1"
+          PYTHONUNBUFFERED: "1"   # ログの順序が入れ替わらないように
         run: python meat_flyer_bot.py
