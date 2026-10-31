@@ -8,24 +8,23 @@ Geminiの画像認識で抽出し、LINEに送るスクリプト。
 環境変数(GitHub Actionsの Secrets / Variables で設定する):
     GEMINI_API_KEY                  Gemini APIキー(news_bot.pyと共通でOK)
     LINE_CHANNEL_ACCESS_TOKEN_MEAT  このbot専用のLINE公式アカウントのトークン
-    GEMINI_MODEL                    (任意)主モデル。未指定なら DEFAULT_GEMINI_MODEL
-    GEMINI_FALLBACK_MODELS          (任意)カンマ区切りの予備モデル。未指定なら DEFAULT_FALLBACK_MODELS
+    GEMINI_MODELS                   (任意)試すモデルの順番(カンマ区切り)。未指定なら自動で選ぶ(gemini_client.py参照)
 
 注意:
     個人利用・1日1回程度のアクセスを想定している。高頻度アクセスやデータの再配布はしないこと。
 """
 
-import base64
 import datetime
-import json
 import os
 import re
 import sys
-import time
 from dataclasses import dataclass
 from typing import Optional
 
 import requests
+
+from gemini_client import GeminiClient, GeminiError, encode_image, parse_json_response
+from line_client import LineClient, flex_box, flex_text
 
 # ---------------------------------------------------------------------------
 # 設定値
@@ -33,27 +32,10 @@ import requests
 
 STORE_NAME = "マルエツ 平間店"
 NO_DEALS_MESSAGE = "本日は生肉の特売情報が見つかりませんでした。"
+RETRY_HINT_MESSAGE = "本日のチラシ解析に失敗しました(Geminiの混雑など)。\n「再実行」と送ると、もう一度試します。"
 STORE_PAGE_URL = "https://tokubai.co.jp/%E3%83%9E%E3%83%AB%E3%82%A8%E3%83%84/13082"
 
-# gemini-flash-latest は「常に最新のFlash」を指すエイリアス。挙動を固定したいときは
-# GitHubの Variables に GEMINI_MODEL を登録して、バージョンを明示する。
-DEFAULT_GEMINI_MODEL = "gemini-flash-latest"
-# 主モデルが混雑(503)・上限(429)・提供終了(404)のときに順に試す予備モデル。
-DEFAULT_FALLBACK_MODELS = []  # liteは精度が落ちるため使わない。必要なら環境変数 GEMINI_FALLBACK_MODELS で指定
-
-GEMINI_ENDPOINT = "https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
-LINE_BROADCAST_URL = "https://api.line.me/v2/bot/message/broadcast"
-
-# 一時的な不調なので、待って再試行する価値があるステータス
-RETRYABLE_STATUSES = {429, 500, 502, 503, 504}
-# 再試行しても直らないが、別のモデルなら成功しうるステータス(404 = モデル提供終了)
-FALLBACK_STATUSES = RETRYABLE_STATUSES | {404}
-PRIMARY_MODEL_RETRY_WAITS = [15, 30, 60, 60]  # 主モデルは粘る(精度優先。チラシ1枚あたり最大約2.8分)
-FALLBACK_MODEL_RETRY_WAITS = [5, 10]  # 予備モデルは短めに(全体が長引かないように)
-
-GEMINI_TIMEOUT_SECONDS = 120
 HTTP_TIMEOUT_SECONDS = 30
-GEMINI_MAX_OUTPUT_TOKENS = 4096
 
 LEAFLET_ID_PATTERN = re.compile(r"/leaflets/(\d+)")
 # & を除外するのは、HTMLエスケープされた &quot; の手前で止めるため
@@ -75,7 +57,6 @@ WEEKDAYS_JP = ["月", "火", "水", "木", "金", "土", "日"]
 COLOR_HEADER_BG = "#8B3A3A"
 COLOR_HEADER_SUBTEXT = "#F0D9D9"
 COLOR_ACCENT = "#B23B3B"
-COLOR_TEXT = "#1A1A1A"
 COLOR_MUTED = "#666666"
 COLOR_WHITE = "#FFFFFF"
 
@@ -83,18 +64,6 @@ COLOR_WHITE = "#FFFFFF"
 # ---------------------------------------------------------------------------
 # データ型
 # ---------------------------------------------------------------------------
-
-
-class GeminiError(RuntimeError):
-    """Gemini APIの呼び出しが、リトライ・フォールバックを尽くしても失敗した"""
-
-
-@dataclass(frozen=True)
-class Settings:
-    gemini_api_key: str
-    line_token: str
-    gemini_model: str
-    fallback_models: list
 
 
 @dataclass(frozen=True)
@@ -129,21 +98,6 @@ class CollectionResult:
         return self.leaflets_total > 0 and self.leaflets_failed == self.leaflets_total
 
 
-def load_settings():
-    fallbacks_env = os.environ.get("GEMINI_FALLBACK_MODELS")
-    if fallbacks_env is None:
-        fallback_models = DEFAULT_FALLBACK_MODELS
-    else:
-        fallback_models = [m.strip() for m in fallbacks_env.split(",") if m.strip()]
-
-    return Settings(
-        gemini_api_key=os.environ["GEMINI_API_KEY"],
-        line_token=os.environ["LINE_CHANNEL_ACCESS_TOKEN_MEAT"],
-        gemini_model=os.environ.get("GEMINI_MODEL", "").strip() or DEFAULT_GEMINI_MODEL,
-        fallback_models=fallback_models,
-    )
-
-
 # ---------------------------------------------------------------------------
 # 日付
 # ---------------------------------------------------------------------------
@@ -168,10 +122,6 @@ def http_get(url):
     return response
 
 
-def http_post(url, headers, payload, timeout):
-    return requests.post(url, headers=headers, json=payload, timeout=timeout)
-
-
 # ---------------------------------------------------------------------------
 # トクバイ(チラシの取得)
 # ---------------------------------------------------------------------------
@@ -191,92 +141,12 @@ def fetch_leaflet_image_url(leaflet_id):
 
 
 def fetch_image_base64(image_url):
-    return base64.b64encode(http_get(image_url).content).decode("ascii")
+    return encode_image(http_get(image_url).content)
 
 
 # ---------------------------------------------------------------------------
-# Gemini(画像から生肉の特売を抽出)
+# Gemini(画像から生肉の特売を抽出。呼び出しの共通処理は gemini_client.py)
 # ---------------------------------------------------------------------------
-
-
-class GeminiClient:
-    """主モデルが使えないとき、予備モデルへ自動で切り替えながらGeminiを呼ぶ"""
-
-    def __init__(self, api_key, primary_model, fallback_models):
-        self._api_key = api_key
-        self._models = list(dict.fromkeys([primary_model, *fallback_models]))
-
-    def generate_with_image(self, prompt, image_base64):
-        payload = {
-            "contents": [
-                {
-                    "parts": [
-                        {"text": prompt},
-                        {"inline_data": {"mime_type": "image/jpeg", "data": image_base64}},
-                    ]
-                }
-            ],
-            "generationConfig": {
-                "responseMimeType": "application/json",
-                "maxOutputTokens": GEMINI_MAX_OUTPUT_TOKENS,
-            },
-        }
-
-        failures = []
-        for index, model in enumerate(self._models):
-            waits = PRIMARY_MODEL_RETRY_WAITS if index == 0 else FALLBACK_MODEL_RETRY_WAITS
-            response = self._post_with_retry(model, payload, waits)
-
-            if response is not None and response.status_code == 200:
-                if index > 0:
-                    print(f"[INFO] 予備モデル {model} で成功しました")
-                return self._extract_text(response.json())
-
-            if response is None:
-                failures.append(f"{model}: 接続できませんでした")
-            elif response.status_code in FALLBACK_STATUSES:
-                failures.append(f"{model}: HTTP {response.status_code} {response.text[:200]}")
-            else:
-                # 400/401/403(キー不正など)はモデルを変えても直らないので、即エラーにする
-                raise GeminiError(f"Gemini APIエラー(model={model}): {response.status_code} {response.text[:500]}")
-            print(f"[WARN] {failures[-1][:150]} → 次のモデルを試します", file=sys.stderr)
-
-        raise GeminiError("すべてのGeminiモデルで失敗しました: " + " | ".join(failures))
-
-    def _post_with_retry(self, model, payload, waits):
-        """一時的な不調なら待って再試行する。最後の応答を返す(通信自体に失敗し続けたら None)"""
-        url = GEMINI_ENDPOINT.format(model=model)
-        headers = {"Content-Type": "application/json", "x-goog-api-key": self._api_key}
-        response = None
-
-        for attempt, wait in enumerate([*waits, None]):  # 最後の試行の後は待たない
-            try:
-                response = http_post(url, headers, payload, GEMINI_TIMEOUT_SECONDS)
-                if response.status_code not in RETRYABLE_STATUSES:
-                    return response
-                reason = f"HTTP {response.status_code}"
-            except (requests.ConnectionError, requests.Timeout) as error:
-                response = None
-                reason = f"通信エラー: {error}"
-
-            if wait is None:
-                break
-            print(
-                f"[WARN] {model} が一時的に使えません({reason})。"
-                f"{wait}秒待って再試行します({attempt + 1}/{len(waits)})",
-                file=sys.stderr,
-            )
-            time.sleep(wait)
-
-        return response
-
-    @staticmethod
-    def _extract_text(response_json):
-        try:
-            parts = response_json["candidates"][0]["content"]["parts"]
-            return "".join(part.get("text", "") for part in parts)
-        except (KeyError, IndexError, TypeError) as error:
-            raise GeminiError(f"Geminiの応答解析に失敗しました: {response_json}") from error
 
 
 def build_extraction_prompt(date_label):
@@ -313,14 +183,11 @@ def build_extraction_prompt(date_label):
 
 
 def parse_deals_json(raw_text):
-    text = raw_text.strip()
-    if text.startswith("```"):  # 念のため、コードブロックで返ってきた場合に備える
-        text = text.split("```")[1].removeprefix("json").strip()
-    return [MeatDeal.from_dict(item) for item in json.loads(text)]
+    return [MeatDeal.from_dict(item) for item in parse_json_response(raw_text)]
 
 
 def extract_meat_deals(gemini, image_base64, date_label):
-    raw_text = gemini.generate_with_image(build_extraction_prompt(date_label), image_base64)
+    raw_text = gemini.generate(build_extraction_prompt(date_label), image_base64=image_base64, json_mode=True)
     return parse_deals_json(raw_text)
 
 
@@ -329,18 +196,10 @@ def extract_meat_deals(gemini, image_base64, date_label):
 # ---------------------------------------------------------------------------
 
 
-def _text(text, size="sm", color=COLOR_TEXT, **extra):
-    return {"type": "text", "text": text, "size": size, "color": color, **extra}
-
-
-def _box(contents, layout="vertical", **extra):
-    return {"type": "box", "layout": layout, "contents": contents, **extra}
-
-
 def _build_discount_badge(discount):
     # backgroundColor は box にしか指定できないため、text を box で包んでバッジにする
-    return _box(
-        [_text(discount, size="xxs", color=COLOR_WHITE, align="center")],
+    return flex_box(
+        [flex_text(discount, size="xxs", color=COLOR_WHITE, align="center")],
         backgroundColor=COLOR_ACCENT,
         cornerRadius="4px",
         paddingAll="2px",
@@ -349,24 +208,24 @@ def _build_discount_badge(discount):
 
 
 def _build_deal_row(deal):
-    price_line = [_text(deal.price, size="xs", color=COLOR_ACCENT, weight="bold", flex=0)]
+    price_line = [flex_text(deal.price, size="xs", color=COLOR_ACCENT, weight="bold", flex=0)]
     if deal.discount:
         price_line.append(_build_discount_badge(deal.discount))
 
-    return _box(
+    return flex_box(
         [
-            _text(deal.product, weight="bold", wrap=True),
-            _box(price_line, layout="horizontal", margin="xs"),
+            flex_text(deal.product, weight="bold", wrap=True),
+            flex_box(price_line, layout="horizontal", margin="xs"),
         ],
         margin="md",
     )
 
 
 def _build_header(date_label):
-    return _box(
+    return flex_box(
         [
-            _text("🥩 本日の生肉チラシ情報", size="lg", color=COLOR_WHITE, weight="bold"),
-            _text(f"{date_label}  {STORE_NAME}", size="xs", color=COLOR_HEADER_SUBTEXT, margin="sm"),
+            flex_text("🥩 本日の生肉チラシ情報", size="lg", color=COLOR_WHITE, weight="bold"),
+            flex_text(f"{date_label}  {STORE_NAME}", size="xs", color=COLOR_HEADER_SUBTEXT, margin="sm"),
         ],
         backgroundColor=COLOR_HEADER_BG,
         paddingAll="20px",
@@ -375,7 +234,7 @@ def _build_header(date_label):
 
 def _build_body_contents(deals):
     if not deals:
-        return [_text(NO_DEALS_MESSAGE, color=COLOR_MUTED, wrap=True)]
+        return [flex_text(NO_DEALS_MESSAGE, color=COLOR_MUTED, wrap=True)]
 
     contents = []
     for index, deal in enumerate(deals):
@@ -389,7 +248,7 @@ def build_flex_message(deals, date_label):
     return {
         "type": "bubble",
         "header": _build_header(date_label),
-        "body": _box(_build_body_contents(deals), paddingAll="20px"),
+        "body": flex_box(_build_body_contents(deals), paddingAll="20px"),
     }
 
 
@@ -398,28 +257,6 @@ def format_deals_as_text(deals):
     if not deals:
         return NO_DEALS_MESSAGE
     return "\n".join(["本日の生肉特売情報:", *(deal.as_text() for deal in deals)])
-
-
-# ---------------------------------------------------------------------------
-# LINE(送信)
-# ---------------------------------------------------------------------------
-
-
-class LineClient:
-    def __init__(self, channel_access_token):
-        self._token = channel_access_token
-
-    def send_flex(self, bubble, alt_text):
-        self._broadcast({"type": "flex", "altText": alt_text, "contents": bubble})
-
-    def send_text(self, text):
-        self._broadcast({"type": "text", "text": text[:4900]})  # LINEの上限は5000文字
-
-    def _broadcast(self, message):
-        headers = {"Authorization": f"Bearer {self._token}", "Content-Type": "application/json"}
-        response = http_post(LINE_BROADCAST_URL, headers, {"messages": [message]}, HTTP_TIMEOUT_SECONDS)
-        if response.status_code != 200:
-            raise RuntimeError(f"LINE送信に失敗しました: {response.status_code} {response.text}")
 
 
 # ---------------------------------------------------------------------------
@@ -438,10 +275,15 @@ def analyze_leaflet(gemini, leaflet_id, date_label):
 def collect_deals(gemini, leaflet_ids, date_label):
     """全チラシを解析して特売情報を集める。1枚の失敗で全体を止めず、失敗数を数えておく"""
     deals, failed = [], 0
-    for leaflet_id in leaflet_ids:
+    for index, leaflet_id in enumerate(leaflet_ids):
         try:
             deals.extend(analyze_leaflet(gemini, leaflet_id, date_label))
-        except Exception as error:  # 1枚の失敗で他のチラシまで諦めない
+        except GeminiError as error:
+            # 全モデルが使えない状態。残りを試しても同じなので打ち切る(待ち時間の無駄を避ける)
+            failed += len(leaflet_ids) - index
+            print(f"[WARN] チラシ {leaflet_id} 以降の解析を打ち切ります: {error}", file=sys.stderr)
+            break
+        except Exception as error:  # 画像URLが取れないなど、1枚だけの失敗で他のチラシまで諦めない
             failed += 1
             print(f"[WARN] チラシ {leaflet_id} の解析に失敗: {error}", file=sys.stderr)
     return CollectionResult(deals=deals, leaflets_total=len(leaflet_ids), leaflets_failed=failed)
@@ -450,7 +292,7 @@ def collect_deals(gemini, leaflet_ids, date_label):
 def notify(line, result, date_label):
     # 全滅のときに「特売なし」と送ると、本当に無かったのか失敗したのか区別がつかない
     if result.all_failed:
-        line.send_text("本日のチラシ解析に失敗しました。GitHub Actionsのログを確認してください。")
+        line.send_text(RETRY_HINT_MESSAGE)
         return
 
     try:
@@ -461,9 +303,8 @@ def notify(line, result, date_label):
 
 
 def main():
-    settings = load_settings()
-    gemini = GeminiClient(settings.gemini_api_key, settings.gemini_model, settings.fallback_models)
-    line = LineClient(settings.line_token)
+    gemini = GeminiClient.from_env()
+    line = LineClient(os.environ["LINE_CHANNEL_ACCESS_TOKEN_MEAT"])
     date_label = today_label()
     print(f"本日: {date_label}")
 
